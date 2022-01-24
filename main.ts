@@ -41,25 +41,6 @@ export default class Workflow extends Plugin {
 		const statusBarItemEl = this.addStatusBarItem();
 		statusBarItemEl.setText('No Current Workflow');
 
-		// This adds a simple command that can be triggered anywhere
-		// this.addCommand({
-		// 	id: 'open-sample-modal-simple',
-		// 	name: 'Open sample modal (simple)',
-		// 	callback: () => {
-		// 		new WorkflowModal(this.app).open();
-		// 	}
-		// });
-		// This adds an editor command that can perform some operation on the current editor instance
-		// this.addCommand({
-		// 	id: 'sample-editor-command',
-		// 	name: 'Sample editor command',
-		// 	editorCallback: (editor: Editor, view: MarkdownView) => {
-		// 		console.log(editor.getSelection());
-		// 		editor.replaceSelection('Sample Editor Command');
-		// 	}
-		// });
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-
 		this.addCommand({
 			id: 'start-workflow',
 			name: 'Start Workflow',
@@ -84,15 +65,6 @@ export default class Workflow extends Plugin {
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		// this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-		// 	console.log('click', evt);
-		// });
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		// this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
 	}
 
 	onunload() {
@@ -120,12 +92,18 @@ type SetVariable = {
   value: string;
 };
 
+type GetVariable = {
+  type: 'get-variable';
+  name: string;
+  line: number;
+};
+
 type UnsetVariable = {
   type: 'unset-variable';
   name: string;
 }
 
-type Instruction = SetContext | SetVariable | UnsetVariable;
+type Instruction = SetContext | SetVariable | UnsetVariable | GetVariable;
 
 const countHashes = (str: string): number => {
   let i = 0;
@@ -137,7 +115,7 @@ const countHashes = (str: string): number => {
   return i;
 } 
 
-function getInstruction(text: string): Instruction | void {
+function getInstruction(text: string, line: number): Instruction | void {
   if (text.startsWith("#")) {
     const depth = countHashes(text) - 1;
     const context = text.replace(/^(#+\s)/,"")
@@ -148,7 +126,6 @@ function getInstruction(text: string): Instruction | void {
     }
   }
   if (text.startsWith("%%workflow set ")) {
-    console.log(text);
     const split = text.split(" = ");
     if(split.length == 2) {
       return {
@@ -158,10 +135,28 @@ function getInstruction(text: string): Instruction | void {
       }
     }
   }
+  if (text.startsWith("%%workflow set_temp ")) {
+    const split = text.split(" = ");
+    if(split.length == 2) {
+      return {
+        type: 'set-variable',
+        name: split[0].replace(/^(%%workflow set_temp\s)/, ""),
+        value: split[1].replace(/(\s*%%$)/, "")
+      }
+    }
+  }
   if (text.startsWith("%%workflow unset ")) {
     const name = text.replace(/^(%%workflow unset\s)/, "").replace(/(\s*%%$)/, "");
     return {
       type: 'unset-variable',
+      name: name
+    }
+  }
+  if (text.startsWith("%%workflow get ")) {
+    const name = text.replace(/^(%%workflow get\s)/, "").replace(/(\s*%%$)/, "");
+    return {
+      type: 'get-variable',
+      line: line,
       name: name
     }
   }
@@ -232,81 +227,118 @@ class WorkflowModal extends Modal {
 		contentEl.empty();
 	}
 
+  setInputValue(variable: string, value: string, line: number) {
+    this.workflowState.variables[variable] = value;
+    this.app.vault.read(this.app.workspace.getActiveFile()).then((contents) => {
+      const lines = contents.split("\n")
+      lines.splice(line + 1, 1, `%%workflow set_temp ${variable} = ${value}%%`)
+
+      this.app.vault.modify(this.app.workspace.getActiveFile(), lines.join("\n"));
+    })
+  }
+
   render() {
 		const {contentEl, workflowState} = this;
     const context = workflowState.context.join(" > ");
-    const upUntil = workflowState.getNext(workflowState.line);
-    let workflowLines;
-    if(upUntil) {
-      workflowLines = workflowState.lines.slice(workflowState.line, upUntil);
-    } else {
-      workflowLines = workflowState.lines.slice(workflowState.line);
-    }
 
-    const workflowText = workflowLines.filter((line) => !getInstruction(line)).join("\n");
+    const workflowText = this.workflowState.getText(this.workflowState.line).join("\n");
 
     contentEl.empty()
 
     const header = contentEl.createEl("div");
-    header.addClass("modal");
-    header.createEl('h4', {text: context});
-    Object.keys(workflowState.variables).forEach((key) => {
-      header.createEl('h5', {text: `${key}: ${workflowState.variables[key]}`})
-    });
-    const div = header.createEl('div');
 
-    MarkdownRenderer.renderMarkdown(workflowText, div, '', this.app.workspace.getActiveViewOfType(MarkdownView))
+    if(workflowState.getting.length > 0) {
+      workflowState.getting.forEach((instruction) => {
+        const settings = new Setting(contentEl);
+        settings.setClass("mod-settings")
+        settings
+        .setName(instruction.name)
+        .addText((text) => {
+          text
+            .onChange((value) => {
+              this.setInputValue(instruction.name, value, instruction.line)
+            })
+          }
+        )
+      })
 
-    const settings = new Setting(contentEl);
-    settings.setClass("mod-settings")
-    settings
-    .setDesc("foobar")
-    .addButton((btn) =>
-      btn
-        .setButtonText("Cancel Workflow")
-        .onClick(() => {
-          this.close()
-          this.removeLine();
-        }));
-    if (workflowState.getPrevious(workflowState.line)) {
-      settings
-      .addButton((btn) =>
+      const settings = new Setting(contentEl);
+      settings.setClass("mod-settings")
+
+      settings.addButton((btn) => {
         btn
-          .setButtonText("Previous")
+          .setButtonText("Save")
           .onClick(() => {
-            this.writeLine()
-            workflowState.previous();
-            workflowState.setContext();
+            this.workflowState.getting = [];
+            this.workflowState.lines = removeGetters(this.workflowState.lines);
             this.render();
-          }));
-    }
+          })
+      })
 
-    if(workflowState.line === workflowState.lines.length - 1) {
-      settings
-      .addButton((btn) =>
-        btn
-          .setButtonText("Complete")
-          .setClass("mod-warning")
-          .onClick(() => {
-            this.close();
-            this.removeLine();
-          }));
+      
     } else {
+      const settings = new Setting(contentEl);
+      settings.setClass("mod-settings")
+
+      header.addClass("modal");
+      header.createEl('h4', {text: context});
+      const list = header.createEl('div')
+      Object.keys(workflowState.variables).forEach((key) => {
+        list.createEl('span', {text: `${key}: ${workflowState.variables[key]}`});
+        list.createEl('br');
+      });
+      const div = header.createEl('div');
+
+      MarkdownRenderer.renderMarkdown(workflowText, div, '', this.app.workspace.getActiveViewOfType(MarkdownView))
+
       settings
       .addButton((btn) =>
         btn
-          .setButtonText("Next")
+          .setButtonText("Cancel Workflow")
           .onClick(() => {
-            workflowState.next();
-            this.writeLine()
-            workflowState.setContext();
-            this.render();
+            this.close()
+            this.removeLine(true);
           }));
+      if (workflowState.getPrevious(workflowState.line)) {
+        settings
+        .addButton((btn) =>
+          btn
+            .setButtonText("Previous")
+            .onClick(() => {
+              this.writeLine()
+              workflowState.previous();
+              workflowState.setContext();
+              this.render();
+            }));
+      }
+
+      if(workflowState.line === workflowState.lines.length - 1) {
+        settings
+        .addButton((btn) =>
+          btn
+            .setButtonText("Complete")
+            .setClass("mod-warning")
+            .onClick(() => {
+              this.close();
+              this.removeLine(true);
+            }));
+      } else {
+        settings
+        .addButton((btn) =>
+          btn
+            .setButtonText("Next")
+            .onClick(() => {
+              workflowState.next();
+              this.writeLine()
+              workflowState.setContext();
+              this.render();
+            }));
+      }
     }
   }
 
   writeLine() {
-    this.removeLine().then(() => {
+    this.removeLine(false).then(() => {
       this.app.vault.read(this.app.workspace.getActiveFile()).then((contents) => {
         const lines = contents.split("\n")
         const line = this.workflowState.fileLine + this.workflowState.line;
@@ -316,7 +348,7 @@ class WorkflowModal extends Modal {
     });
   }
 
-  removeLine() {
+  removeLine(removeVars?: boolean) {
     return this.app.vault.read(this.app.workspace.getActiveFile()).then((contents) => {
       const lines = contents.split("\n")
       const lastLine = this.workflowState.fileLine + this.workflowState.lastLine;
@@ -326,7 +358,12 @@ class WorkflowModal extends Modal {
           newLines.push(lines[i]);
         } else {
           if(lines[i] !== "%%workflow here%%") {
-            newLines.push(lines[i])
+            if(lines[i].startsWith("%%workflow set_temp ") && removeVars) {
+              const line = lines[i].replace("%%workflow set_temp ", "%%workflow get ").replace(/(\s+=.*%%$)/, "%%")
+              newLines.push(line);
+            } else {
+              newLines.push(lines[i])
+            }
           }
         }
       }
@@ -334,11 +371,20 @@ class WorkflowModal extends Modal {
     })
   }
 }
+function removeGetters(lines: string[]) {
+  return lines.map((line) => {
+    if(line.startsWith("%%workflow get")) {
+      return line.replace("%%workflow get", "%%workflow nothing")
+    } else {
+      return line;
+    }
+  })
+}
 
 function findWorkflowStart(lines: string[], line: number): number {
   for (let i = line; i > 0; i--) {
     if(lines[i] === "%%workflow start%%") {
-      return i + 1;
+      return i;
     }
   }
   return 0;
@@ -352,6 +398,7 @@ class WorkflowState {
   fileLine: number;
   variables: {[key: string]: string};
   lastLine: number;
+  getting: GetVariable[] = [];
 
 	constructor(text: string, line: number) {
     let lines = text.split('\n');
@@ -390,11 +437,74 @@ class WorkflowState {
     const nextText = (this.lines[next] || "").trimStart();
 
     // For now, only bullet points are part of the structure
-    if(nextText.startsWith("-")) {
+    if (nextText.startsWith("%%workflow if ")) {
+      const expression = nextText.replace(/^(%%workflow if\s)/, "").replace(/(\s*%%$)/, "");
+      const parts = expression.split(" = ");
+      if(parts.length == 2) {
+        const variable = parts[0];
+        const value = parts[1];
+        if((this.variables[variable.trim()] || "").trim() !== value.trim()) {
+          return this.skipNext(next + 1);
+        } 
+      }
+      return this.getNext(next);
+    } else if(nextText.startsWith("-")) {
       return next;
     } else {
       return this.getNext(next);
     }
+  }
+
+  getText(line: number, acc: string[] = []): string[] {
+    if(typeof this.lines[line] === "undefined") return;
+    const nextText = (this.lines[line] || "").trimStart();
+
+    // For now, only bullet points are part of the structure
+    if (nextText.startsWith("%%workflow if ")) {
+      const expression = nextText.replace(/^(%%workflow if\s)/, "").replace(/(\s*%%$)/, "");
+      const parts = expression.split(" = ");
+      if(parts.length == 2) {
+        const variable = parts[0];
+        const value = parts[1];
+        if((this.variables[variable.trim()] || "").trim() === value.trim()) {
+          const newNext = this.skipNext(line);
+          if (newNext) {
+            this.getText(newNext, acc);
+          }
+        }
+      }
+
+      return acc;
+    } else {
+      if(nextText.startsWith("-") && acc.length !== 0) {
+        return acc;
+      } else {
+        acc.push(this.lines[line]);
+        return this.getText(line + 1, acc);
+      }
+    }
+  }
+
+  skipNext(line: number, takeUntil?: number): number | void {
+    const nextText = (this.lines[line] || "").trimStart();
+
+    if(takeUntil) {
+      if(nextText.startsWith("#")) {
+        const depth = countHashes(nextText);
+        if(depth <= takeUntil) {
+          return line;
+        } else {
+          return this.skipNext(line + 1, takeUntil);
+        }
+      } else {
+        return this.skipNext(line + 1, takeUntil)
+      }
+    } else if(nextText.startsWith("#")) {
+      const depth = countHashes(nextText);
+      return this.skipNext(line + 1, depth);
+    } else if(nextText.startsWith("-")) {
+      return this.getNext(line);
+    } 
   }
 
   getPrevious(line: number): number | void {
@@ -414,7 +524,7 @@ class WorkflowState {
     this.context = [];
     for (let line = this.start; line < this.line; line++) {
       const text = this.lines[line].trimStart();
-      const instruction = getInstruction(text);
+      const instruction = getInstruction(text, line + this.fileLine);
       if(instruction) {
         this.followInstruction(instruction);
       }
@@ -431,6 +541,9 @@ class WorkflowState {
     }
     if (instruction.type === 'unset-variable') {
       delete this.variables[instruction.name]
+    }
+    if (instruction.type === 'get-variable') {
+      this.getting.push(instruction)
     }
   }
 }
